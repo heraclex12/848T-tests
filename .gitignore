@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# SLURM logs
+*.out
+*.err
+
+# Bash script contains HF token
+translate_advbench.sh
