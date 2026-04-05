@@ -105,3 +105,4 @@ unbabel-comet==2.2.4
 urllib3==2.3.0
 yarl==1.18.3
 zope.interface==7.2
+OpenCC
