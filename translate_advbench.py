@@ -1,44 +1,57 @@
 import json
 import argparse
-import torch
 import os
+import time
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from openai import OpenAI
 import opencc
-from pypinyin import pinyin, Style
 
 
 # ---------------------------------------------------------------------------
-# NLLB setup
+# GPT-based translation
 # ---------------------------------------------------------------------------
 
-def setup_nllb_model(model_name, src_lang="eng_Latn"):
-    """Load NLLB model for seq2seq translation."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, src_lang=src_lang)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
-    model.eval()
-    return {"model": model, "tokenizer": tokenizer, "device": device}
+SIMPLIFIED_SYSTEM_PROMPT = (
+    "You are a translator. Translate the following English text into "
+    "Simplified Chinese. Output ONLY the translation, nothing else."
+)
+
+PINYIN_SYSTEM_PROMPT = (
+    "You are a translator. Translate the following English text into Chinese "
+    "Pinyin (with tone marks). Output ONLY the pinyin, nothing else. "
+    "Do not include Chinese characters, explanations, or punctuation other "
+    "than what appears in standard pinyin."
+)
 
 
-def translate_batch_nllb(texts, nllb_dict, tgt_lang="zho_Hans", max_length=256):
-    """Translate a batch of texts with NLLB."""
-    model = nllb_dict["model"]
-    tokenizer = nllb_dict["tokenizer"]
-    device = nllb_dict["device"]
-
-    inputs = tokenizer(
-        texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length
-    ).to(device)
-
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt_lang),
-            max_new_tokens=max_length,
-        )
-    return tokenizer.batch_decode(generated, skip_special_tokens=True)
+def translate_with_gpt(
+    text: str,
+    client: OpenAI,
+    system_prompt: str,
+    model: str = "gpt-4.1-mini",
+    max_retries: int = 3,
+) -> str:
+    """Translate text using an OpenAI model with a given system prompt."""
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"  GPT translation attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(3)
+            else:
+                return ""
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +60,6 @@ def translate_batch_nllb(texts, nllb_dict, tgt_lang="zho_Hans", max_length=256):
 
 def to_traditional(text, converter):
     return converter.convert(text)
-
-
-def to_pinyin_str(text):
-    result = pinyin(text, style=Style.TONE, heteronym=False)
-    return " ".join(tok[0] for tok in result)
 
 
 # ---------------------------------------------------------------------------
@@ -74,24 +82,31 @@ def select_representative_examples(dataset, n=100):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Translate AdvBench prompts EN→ZH with NLLB (simplified, traditional, pinyin)"
-    )
-    parser.add_argument(
-        "--nllb_model",
-        default="facebook/nllb-200-distilled-600M",
-        help="NLLB model name",
+        description="Translate AdvBench prompts EN→ZH with GPT (simplified, traditional, pinyin)"
     )
     parser.add_argument(
         "--num_examples", type=int, default=100, help="Number of examples to translate"
     )
-    parser.add_argument("--batch_size", type=int, default=8, help="NLLB batch size")
     parser.add_argument(
         "--output_dir",
         default="./advbench_translated/",
         help="Output directory for results",
     )
-    parser.add_argument("--src_lang", default="eng_Latn", help="NLLB source language code")
-    parser.add_argument("--tgt_lang", default="zho_Hans", help="NLLB target language code")
+    parser.add_argument(
+        "--openai_api_key",
+        default=None,
+        help="OpenAI API key (falls back to OPENAI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--openai_base_url",
+        default=None,
+        help="Custom base URL for the OpenAI-compatible API",
+    )
+    parser.add_argument(
+        "--translation_model",
+        default="gpt-4.1",
+        help="OpenAI model to use for translation (default: gpt-4.1)",
+    )
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -107,11 +122,18 @@ def main():
     print(f"Selected {len(subset)} representative examples")
 
     # ------------------------------------------------------------------
-    # 2. Load NLLB
+    # 2. Setup OpenAI client
     # ------------------------------------------------------------------
-    print(f"Loading NLLB model: {args.nllb_model} ...")
-    nllb = setup_nllb_model(args.nllb_model, src_lang=args.src_lang)
-    print(f"Using device: {nllb['device']}")
+    openai_key = args.openai_api_key or os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        print("ERROR: OpenAI API key is required. Use --openai_api_key or set OPENAI_API_KEY.")
+        return
+
+    client_kwargs = {"api_key": openai_key}
+    if args.openai_base_url:
+        client_kwargs["base_url"] = args.openai_base_url
+    client = OpenAI(**client_kwargs)
+    print(f"Using GPT model '{args.translation_model}' for all translations")
 
     # ------------------------------------------------------------------
     # 3. Setup script converters
@@ -124,27 +146,29 @@ def main():
     prompts = subset["prompt"]
     results = []
 
-    for i in tqdm(range(0, len(prompts), args.batch_size), desc="Translating (NLLB)"):
-        batch = prompts[i : i + args.batch_size]
-        simplified_batch = translate_batch_nllb(batch, nllb, tgt_lang=args.tgt_lang)
+    for i, eng in enumerate(tqdm(prompts, desc="Translating (GPT)")):
+        simplified = translate_with_gpt(
+            eng, client, SIMPLIFIED_SYSTEM_PROMPT, model=args.translation_model
+        )
+        traditional = to_traditional(simplified, s2t_converter)
+        pinyin_text = translate_with_gpt(
+            eng, client, PINYIN_SYSTEM_PROMPT, model=args.translation_model
+        )
 
-        for j, (eng, simplified) in enumerate(zip(batch, simplified_batch)):
-            traditional = to_traditional(simplified, s2t_converter)
-            pinyin_text = to_pinyin_str(simplified)
-            results.append(
-                {
-                    "id": i + j,
-                    "english": eng,
-                    "chinese_simplified": simplified,
-                    "chinese_traditional": traditional,
-                    "chinese_pinyin": pinyin_text,
-                }
-            )
+        results.append(
+            {
+                "id": i,
+                "english": eng,
+                "chinese_simplified": simplified,
+                "chinese_traditional": traditional,
+                "chinese_pinyin": pinyin_text,
+            }
+        )
 
     # ------------------------------------------------------------------
     # 5. Save
     # ------------------------------------------------------------------
-    output_file = os.path.join(args.output_dir, f"advbench_nllb_{args.num_examples}.json")
+    output_file = os.path.join(args.output_dir, f"advbench_gpt_{args.num_examples}.json")
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -155,8 +179,6 @@ def main():
         print(f"     ZH-S: {r['chinese_simplified']}")
         print(f"     ZH-T: {r['chinese_traditional']}")
         print(f"     PY:   {r['chinese_pinyin'][:80]}")
-
-    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
